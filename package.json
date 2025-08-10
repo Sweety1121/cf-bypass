@@ -1,0 +1,9 @@
+{
+  "name": "cf-bypass",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.1.0",
+    "puppeteer": "^24.16.0"
+  }
+}
