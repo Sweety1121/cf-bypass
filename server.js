@@ -56,7 +56,6 @@ async function createBrowser(uaFromReq) {
   await page.setViewport({ width: 1366, height: 824, deviceScaleFactor: 1 });
   await page.setUserAgent(ua);
 
-  // Important: allow CF challenge resources
   await page.setExtraHTTPHeaders({
     'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
     'upgrade-insecure-requests': '1',
@@ -66,23 +65,18 @@ async function createBrowser(uaFromReq) {
 }
 
 async function passCloudflare(page, target) {
-  // Try up to 4 passes
   for (let attempt = 1; attempt <= 4; attempt++) {
     await page.goto(target, { waitUntil: 'networkidle0', timeout: 60000 });
 
-    // If title is not CF interstitial, assume passed
     const title = (await page.title() || '').toLowerCase();
     if (!/just a moment|正在验证|please wait|请稍候/.test(title)) {
       return true;
     }
 
-    // Give time for Turnstile/JS to run
     await sleep(8000);
 
-    // If still challenge, try a soft reload (CF often redirects after a delay)
     const content = await page.content();
     if (/challenges\.cloudflare\.com|__cf_chl_/.test(content)) {
-      // gentle reload
       await page.reload({ waitUntil: 'networkidle0', timeout: 60000 });
       await sleep(5000);
       const t2 = (await page.title() || '').toLowerCase();
@@ -90,7 +84,6 @@ async function passCloudflare(page, target) {
         return true;
       }
     } else {
-      // not seeing challenge markers anymore
       return true;
     }
   }
@@ -107,7 +100,6 @@ app.get('/fetch', async (req, res) => {
     const { browser: b, page } = await createBrowser(req.query.ua);
     browser = b;
 
-    // optional referer/cookie
     const extra = {};
     if (req.query.referer) extra['Referer'] = String(req.query.referer);
     if (req.query.cookie)  extra['Cookie']  = String(req.query.cookie);
@@ -116,7 +108,6 @@ app.get('/fetch', async (req, res) => {
     const ok = await passCloudflare(page, target);
     if (!ok) throw new Error('Cloudflare challenge not passed after retries');
 
-    // One more settle
     await sleep(1000);
     const html = await page.content();
     res.set('content-type', 'text/html; charset=utf-8');
@@ -152,40 +143,22 @@ app.get('/img', async (req, res) => {
     res.set('content-type', ct);
     if (cd) res.set('content-disposition', cd);
 
-    return resp.body.pipe(res);
+    const buf = Buffer.from(await resp.arrayBuffer());
+    res.send(buf);
   } catch (err) {
-    res.status(500).send('IMG ERR: ' + String(err && err.message ? err.message : err));
+    res.status(500).send('ERR: ' + String(err && err.message ? err.message : err));
   }
 });
 
 // ---- /img-auto ----
 app.get('/img-auto', async (req, res) => {
-  try {
-    const u = req.query.url;
-    if (!u) return res.status(400).send('url is required');
-
-    const headers = {
-      'User-Agent': DEFAULT_UA,
-      'Referer': req.query.referer ? String(req.query.referer) : DEFAULT_REFERER,
-    };
-
-    const controller = new AbortController();
-    const timer = setTimeout(()=>controller.abort(), 20000);
-    const resp = await fetch(u, { headers, signal: controller.signal });
-    clearTimeout(timer);
-
-    if (!resp.ok) return res.status(resp.status).send('Upstream ' + resp.status);
-
-    const ct = resp.headers.get('content-type') || 'application/octet-stream';
-    const cd = resp.headers.get('content-disposition');
-    res.set('content-type', ct);
-    if (cd) res.set('content-disposition', cd);
-
-    return resp.body.pipe(res);
-  } catch (err) {
-    res.status(500).send('IMG ERR: ' + String(err) );
-  }
+  if (!req.query.url) return res.status(400).send('url is required');
+  req.query.referer = DEFAULT_REFERER;
+  return app._router.handle(req, res, require('finalhandler')(req, res));
 });
 
+// ---- Start server ----
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Server listening on http://0.0.0.0:' + PORT));
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server listening on http://0.0.0.0:${PORT}`);
+});
