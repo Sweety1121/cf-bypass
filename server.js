@@ -1,164 +1,95 @@
-/**
- * server.js (CF-advanced, stealth + retries)
- * Endpoints:
- *   GET /ping
- *   GET /fetch?url=... [&cookie=...&ua=...&referer=...]
- *   GET /img?url=... [&referer=...&cookie=...&ua=...]
- *   GET /img-auto?url=... (uses DEFAULT_REFERER)
- *
- * Requirements (once):
- *   npm i puppeteer-extra puppeteer-extra-plugin-stealth user-agents
- */
+import express from 'express';
+import puppeteer from 'puppeteer-extra';
+import Stealth from 'puppeteer-extra-plugin-stealth';
 
-const express = require('express');
-
-// ---- Stealth Puppeteer setup ----
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const UserAgent = require('user-agents');
-puppeteer.use(StealthPlugin());
+puppeteer.use(Stealth());
 
 const app = express();
+const PORT = process.env.PORT || 8080;
 
-// ---- CORS ----
-app.use((_, res, next) => {
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Headers', '*');
-  next();
-});
+// 走你已经打通的 Clash 代理
+const PROXY = process.env.PUPPETEER_PROXY || 'socks5h://127.0.0.1:7890';
+// 指向 VPS 的 chromium
+const CHROME = process.env.CHROME_PATH || '/usr/bin/chromium';
 
-// ---- Health ----
-app.get('/ping', (_req, res) => res.send('pong'));
-
-// ---- Config ----
-const CHROMIUM_PATH   = '/usr/bin/chromium';
-const USER_DATA_DIR   = '/root/.cache/pptr-profile';
-const DEFAULT_UA      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36';
-const DEFAULT_REFERER = 'https://bakamh.com/'; // for image proxy
-
-function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-
-async function createBrowser(uaFromReq) {
-  const ua = uaFromReq || new UserAgent({ deviceCategory: 'desktop' }).toString();
-  const browser = await puppeteer.launch({
-    executablePath: CHROMIUM_PATH,
+const launchBrowser = () =>
+  puppeteer.launch({
+    executablePath: CHROME,
     headless: 'new',
-    userDataDir: USER_DATA_DIR,
     args: [
+      `--proxy-server=${PROXY}`,
       '--no-sandbox',
       '--disable-setuid-sandbox',
-      '--disable-gpu',
-      '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled',
-    ],
-  });
-  const page = await browser.newPage();
-  await page.setViewport({ width: 1366, height: 824, deviceScaleFactor: 1 });
-  await page.setUserAgent(ua);
-
-  await page.setExtraHTTPHeaders({
-    'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    'upgrade-insecure-requests': '1',
+      '--disable-dev-shm-usage'
+    ]
   });
 
-  return { browser, page };
-}
-
-async function passCloudflare(page, target) {
-  for (let attempt = 1; attempt <= 4; attempt++) {
-    await page.goto(target, { waitUntil: 'networkidle0', timeout: 60000 });
-
-    const title = (await page.title() || '').toLowerCase();
-    if (!/just a moment|正在验证|please wait|请稍候/.test(title)) {
-      return true;
-    }
-
-    await sleep(8000);
-
-    const content = await page.content();
-    if (/challenges\.cloudflare\.com|__cf_chl_/.test(content)) {
-      await page.reload({ waitUntil: 'networkidle0', timeout: 60000 });
-      await sleep(5000);
-      const t2 = (await page.title() || '').toLowerCase();
-      if (!/just a moment|正在验证|please wait|请稍候/.test(t2)) {
-        return true;
-      }
-    } else {
-      return true;
-    }
-  }
-  return false;
-}
-
-// ---- /fetch ----
-app.get('/fetch', async (req, res) => {
-  const target = req.query.url;
-  if (!target) return res.status(400).send('url is required');
-
-  let browser;
+async function fetchHTML(url, {timeoutMs = 45000} = {}) {
+  const browser = await launchBrowser();
   try {
-    const { browser: b, page } = await createBrowser(req.query.ua);
-    browser = b;
+    const page = await browser.newPage();
+    await page.setViewport({width: 1366, height: 824});
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36'
+    );
 
-    const extra = {};
-    if (req.query.referer) extra['Referer'] = String(req.query.referer);
-    if (req.query.cookie)  extra['Cookie']  = String(req.query.cookie);
-    if (Object.keys(extra).length) await page.setExtraHTTPHeaders(extra);
-
-    const ok = await passCloudflare(page, target);
-    if (!ok) throw new Error('Cloudflare challenge not passed after retries');
-
-    await sleep(1000);
-    const html = await page.content();
-    res.set('content-type', 'text/html; charset=utf-8');
-    res.send(html);
-  } catch (err) {
-    res.status(500).send('ERR: ' + String(err && err.message ? err.message : err));
-  } finally {
-    if (browser) { try { await browser.close(); } catch {} }
-  }
-});
-
-// ---- /img ----
-app.get('/img', async (req, res) => {
-  try {
-    const u = req.query.url;
-    if (!u) return res.status(400).send('url is required');
-
-    const headers = {
-      'User-Agent': (req.query.ua && String(req.query.ua)) || DEFAULT_UA,
+    const tryOnce = async () => {
+      await page.goto(url, {waitUntil: 'networkidle2', timeout: timeoutMs});
+      // 简单挑战判定
+      const title = await page.title();
+      const html = await page.content();
+      const challenged =
+        /just a moment|请稍候|正在验证|cf-mitigated/i.test(title) ||
+        /challenges\.cloudflare\.com|__cf_chl_|cf-mitigated/i.test(html);
+      return {title, html, challenged};
     };
-    if (req.query.referer) headers['Referer'] = String(req.query.referer);
-    if (req.query.cookie)  headers['Cookie']  = String(req.query.cookie);
 
-    const controller = new AbortController();
-    const timer = setTimeout(()=>controller.abort(), 20000);
-    const resp = await fetch(u, { headers, signal: controller.signal });
-    clearTimeout(timer);
+    // 至多 2 次重载
+    let last = await tryOnce();
+    if (last.challenged) {
+      await page.waitForTimeout(3500);
+      await page.reload({waitUntil: 'networkidle2'});
+      last = await tryOnce();
+    }
+    return last.html;
+  } finally {
+    await browser.close().catch(()=>{});
+  }
+}
 
-    if (!resp.ok) return res.status(resp.status).send('Upstream ' + resp.status);
-
-    const ct = resp.headers.get('content-type') || 'application/octet-stream';
-    const cd = resp.headers.get('content-disposition');
-    res.set('content-type', ct);
-    if (cd) res.set('content-disposition', cd);
-
-    const buf = Buffer.from(await resp.arrayBuffer());
-    res.send(buf);
-  } catch (err) {
-    res.status(500).send('ERR: ' + String(err && err.message ? err.message : err));
+app.get('/html', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).send('missing ?url=');
+  try {
+    const html = await fetchHTML(url);
+    res.set('Content-Type', 'text/html; charset=utf-8').send(html);
+  } catch (e) {
+    res.status(502).send(`fetch error: ${e.message || e}`);
   }
 });
 
-// ---- /img-auto ----
-app.get('/img-auto', async (req, res) => {
-  if (!req.query.url) return res.status(400).send('url is required');
-  req.query.referer = DEFAULT_REFERER;
-  return app._router.handle(req, res, require('finalhandler')(req, res));
+app.get('/screenshot', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).send('missing ?url=');
+
+  const browser = await launchBrowser();
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({width: 1366, height: 824});
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36'
+    );
+    await page.goto(url, {waitUntil: 'networkidle2', timeout: 45000});
+    const buf = await page.screenshot({fullPage: true, type: 'png'});
+    res.set('Content-Type', 'image/png').send(buf);
+  } catch (e) {
+    res.status(502).send(`screenshot error: ${e.message || e}`);
+  } finally {
+    await browser.close().catch(()=>{});
+  }
 });
 
-// ---- Start server ----
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server listening on http://0.0.0.0:${PORT}`);
+app.listen(PORT, () => {
+  console.log(`cf-proxy-mini listening on :${PORT}`);
+  console.log(`proxy via ${PROXY}, chrome at ${CHROME}`);
 });
