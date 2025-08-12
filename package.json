@@ -1,9 +1,14 @@
 {
-  "name": "cf-bypass",
+  "name": "cf-proxy-mini",
   "version": "1.0.0",
-  "type": "commonjs",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "CHROME_PATH=${CHROME_PATH:-/usr/bin/chromium} NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt node server.js"
+  },
   "dependencies": {
-    "express": "^5.1.0",
-    "puppeteer": "^24.16.0"
+    "express": "^4.19.2",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   }
 }
